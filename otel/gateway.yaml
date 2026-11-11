@@ -1,0 +1,100 @@
+# OpenTelemetry Collector "gateway": the single entry point for all telemetry.
+#
+# Applications send OTLP here and never talk to a storage back end directly.
+# Changing back ends (for example moving off Splunk) is then a gateway config
+# change, with no change to any application.
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # On-disk queue: if a back end is down or the gateway restarts, data waits
+  # here instead of being dropped.
+  file_storage/queue:
+    directory: /var/lib/otelcol/queue
+    create_directory: true
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch:
+    send_batch_size: 8192
+    timeout: 5s
+  resource/env:
+    attributes:
+      - key: collector.tier
+        value: gateway
+        action: upsert
+
+connectors:
+  # Builds request / error / duration (RED) metrics from spans, so every traced
+  # service gets golden-signal metrics without extra code.
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
+    dimensions:
+      - name: http.route
+      - name: http.response.status_code
+
+exporters:
+  otlphttp/victoriametrics:
+    metrics_endpoint: http://victoriametrics:8428/opentelemetry/v1/metrics
+    sending_queue:
+      storage: file_storage/queue
+  otlphttp/victorialogs:
+    logs_endpoint: http://victorialogs:9428/insert/opentelemetry/v1/logs
+    headers:
+      VL-Stream-Fields: service.name,severity
+    sending_queue:
+      storage: file_storage/queue
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      storage: file_storage/queue
+  # "Legacy" back end used to show dual-shipping during a migration.
+  # In a real migration this would be the old platform's exporter, for example:
+  #   splunk_hec:
+  #     token: ${env:SPLUNK_HEC_TOKEN}
+  #     endpoint: https://splunk.example.com:8088/services/collector
+  file/legacy:
+    path: /var/lib/otelcol/legacy/logs.jsonl
+    rotation:
+      max_megabytes: 50
+      max_backups: 2
+
+service:
+  extensions: [health_check, file_storage/queue]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/env, batch]
+      exporters: [otlp/tempo, spanmetrics]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [memory_limiter, resource/env, batch]
+      exporters: [otlphttp/victoriametrics]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/env, batch]
+      # Dual-ship: every log goes to BOTH the new and the legacy back end until
+      # the new one has been validated, then the legacy exporter is removed.
+      exporters: [otlphttp/victorialogs, file/legacy]

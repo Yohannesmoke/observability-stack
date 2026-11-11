@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file and collector config
+        run: make validate
+
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      - name: End-to-end smoke test
+        run: TIMEOUT=300 ./scripts/smoke-test.sh
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --tail=100

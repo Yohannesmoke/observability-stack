@@ -1,0 +1,131 @@
+name: observability-stack
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  # ── Telemetry pipeline ────────────────────────────────────────────────────
+  otel-gateway:
+    <<: *restart
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    command: ["--config=/etc/otelcol/gateway.yaml"]
+    user: "0"   # writes the on-disk queue and legacy sink to named volumes
+    volumes:
+      - ./otel/gateway.yaml:/etc/otelcol/gateway.yaml:ro
+      - otel-queue:/var/lib/otelcol/queue
+      - legacy-sink:/var/lib/otelcol/legacy
+    ports:
+      - "127.0.0.1:${OTLP_GRPC_PORT:-4317}:4317"   # OTLP gRPC
+      - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP
+    depends_on: [victoriametrics, victorialogs, tempo]
+
+  # ── Storage ───────────────────────────────────────────────────────────────
+  victoriametrics:
+    <<: *restart
+    image: victoriametrics/victoria-metrics:v1.126.0
+    command:
+      - -retentionPeriod=7d
+      - -promscrape.config=/etc/vm/scrape.yaml
+      - -opentelemetry.usePrometheusNaming
+      - -selfScrapeInterval=0
+    volumes:
+      - ./victoriametrics/scrape.yaml:/etc/vm/scrape.yaml:ro
+      - vm-data:/victoria-metrics-data
+    ports: ["127.0.0.1:${VM_PORT:-8428}:8428"]
+
+  victorialogs:
+    <<: *restart
+    image: victoriametrics/victoria-logs:v1.33.0
+    command: ["-retentionPeriod=7d", "-storageDataPath=/vlogs"]
+    volumes: [vl-data:/vlogs]
+    ports: ["127.0.0.1:${VL_PORT:-9428}:9428"]
+
+  tempo:
+    <<: *restart
+    image: grafana/tempo:2.9.0
+    command: ["-config.file=/etc/tempo.yaml"]
+    user: "0"
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  # ── Alerting & synthetic monitoring ───────────────────────────────────────
+  vmalert:
+    <<: *restart
+    image: victoriametrics/vmalert:v1.126.0
+    command:
+      - -datasource.url=http://victoriametrics:8428
+      - -remoteWrite.url=http://victoriametrics:8428
+      - -remoteRead.url=http://victoriametrics:8428
+      - -notifier.url=http://alertmanager:9093
+      - -rule=/etc/vmalert/*.yaml
+      - -evaluationInterval=15s
+    volumes: [./vmalert:/etc/vmalert:ro]
+    ports: ["127.0.0.1:${VMALERT_PORT:-8880}:8880"]
+    depends_on: [victoriametrics, alertmanager]
+
+  alertmanager:
+    <<: *restart
+    image: prom/alertmanager:v0.28.1
+    command: ["--config.file=/etc/alertmanager/alertmanager.yaml"]
+    volumes: [./alertmanager/alertmanager.yaml:/etc/alertmanager/alertmanager.yaml:ro]
+    ports: ["127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"]
+
+  blackbox:
+    <<: *restart
+    image: prom/blackbox-exporter:v0.25.0
+    command: ["--config.file=/etc/blackbox/blackbox.yaml"]
+    volumes: [./blackbox/blackbox.yaml:/etc/blackbox/blackbox.yaml:ro]
+
+  # ── Visualisation ─────────────────────────────────────────────────────────
+  grafana:
+    <<: *restart
+    image: grafana/grafana:12.0.2
+    environment:
+      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "true"        # demo only
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/service-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [victoriametrics, victorialogs, tempo]
+
+  # ── Demo workload ─────────────────────────────────────────────────────────
+  demo-app:
+    <<: *restart
+    build: ./demo-app
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-gateway:4318
+      SERVICE_NAME: checkout
+      ERROR_RATE: "0.05"
+    ports: ["127.0.0.1:${APP_PORT:-8080}:8080"]
+    depends_on: [otel-gateway]
+
+  loadgen:
+    <<: *restart
+    build: ./demo-app
+    command:
+      - python
+      - -c
+      - |
+        import random, time, urllib.request
+        while True:
+            path = random.choice(["/checkout", "/checkout", "/products"])
+            try:
+                urllib.request.urlopen("http://demo-app:8080" + path, timeout=5).read()
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.05, 0.3))
+    depends_on: [demo-app]
+
+volumes:
+  otel-queue:
+  legacy-sink:
+  vm-data:
+  vl-data:
+  tempo-data:
+  grafana-data:

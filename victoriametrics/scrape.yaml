@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: otel-gateway
+    static_configs:
+      - targets: ["otel-gateway:8888"]
+
+  - job_name: victoriametrics
+    static_configs:
+      - targets: ["victoriametrics:8428"]
+
+  - job_name: victorialogs
+    static_configs:
+      - targets: ["victorialogs:9428"]
+
+  - job_name: vmalert
+    static_configs:
+      - targets: ["vmalert:8880"]
+
+  # Synthetic checks: Blackbox Exporter probes each endpoint from the outside,
+  # the same way a user would reach it.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://demo-app:8080/healthz
+          - http://demo-app:8080/products
+          - http://grafana:3000/api/health
+          - http://does-not-exist.invalid/   # always fails: shows what a down target looks like
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

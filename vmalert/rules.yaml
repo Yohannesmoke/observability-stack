@@ -1,0 +1,79 @@
+groups:
+  # ── Recording rules: pre-computed SLIs used by alerts and dashboards ──────
+  - name: sli-recording
+    interval: 30s
+    rules:
+      - record: service:requests:rate5m
+        expr: sum by (service_name) (rate(http_server_request_duration_seconds_count[5m]))
+      - record: service:errors:ratio_rate5m
+        expr: |
+          sum by (service_name) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+            / sum by (service_name) (rate(http_server_request_duration_seconds_count[5m]))
+      - record: service:errors:ratio_rate1h
+        expr: |
+          sum by (service_name) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[1h]))
+            / sum by (service_name) (rate(http_server_request_duration_seconds_count[1h]))
+      - record: service:latency:p95_5m
+        expr: histogram_quantile(0.95, sum by (le, service_name) (rate(http_server_request_duration_seconds_bucket[5m])))
+
+  # ── Service alerts ────────────────────────────────────────────────────────
+  - name: service-alerts
+    rules:
+      # SLO: 99% of requests succeed. Fast burn = budget gone in ~2 days.
+      - alert: ErrorBudgetFastBurn
+        expr: service:errors:ratio_rate1h > (14.4 * 0.01) and service:errors:ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service_name }} is burning its error budget 14x too fast"
+          description: "1h error ratio is {{ $value | humanizePercentage }} against a 1% budget."
+
+      - alert: HighErrorRate
+        expr: service:errors:ratio_rate5m > 0.03
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service_name }} error rate is {{ $value | humanizePercentage }}"
+          description: "More than 3% of requests have returned 5xx for 5 minutes. (The demo app fails ~5% of checkouts on purpose, so this fires.)"
+
+      - alert: HighLatencyP95
+        expr: service:latency:p95_5m > 0.5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service_name }} p95 latency is {{ $value | humanizeDuration }}"
+
+  # ── Synthetic monitoring ──────────────────────────────────────────────────
+  - name: synthetic-alerts
+    rules:
+      - alert: EndpointDown
+        expr: probe_success == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.instance }} is unreachable"
+          description: "Blackbox probe has failed for 2 minutes."
+
+  # ── The monitoring pipeline monitors itself ───────────────────────────────
+  - name: pipeline-alerts
+    rules:
+      - alert: TelemetryExportFailing
+        expr: sum by (exporter) (rate({__name__=~"otelcol_exporter_send_failed_.+_total"}[5m])) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "OTel gateway exporter {{ $labels.exporter }} is failing to deliver data"
+
+      - alert: TelemetryQueueFilling
+        expr: max by (exporter) (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) > 0.8
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Queue for {{ $labels.exporter }} is {{ $value | humanizePercentage }} full; the back end may be down or slow"
+
+      - alert: ScrapeTargetDown
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Scrape target {{ $labels.job }}/{{ $labels.instance }} is down"
